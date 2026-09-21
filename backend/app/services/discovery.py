@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 def content_hash(text: str | None) -> str | None:
     """Stable hash of whitespace/lowercase-normalized text — detects posting
     changes between discovery runs (section 9)."""
-    if not text:
+    if not text or not text.strip():
         return None
     normalized = " ".join(text.lower().split())
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()

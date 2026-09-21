@@ -44,7 +44,8 @@ class RemotiveSource(JobSource):
                 continue
 
             url = raw.get("url")
-            self._description_cache[url] = raw.get("description", "") or ""
+            description = raw.get("description", "") or ""
+            self._description_cache[url] = description
             jobs.append(
                 DiscoveredJob(
                     source=self.name,
@@ -52,7 +53,7 @@ class RemotiveSource(JobSource):
                     url=url,
                     title=raw.get("title"),
                     company=raw.get("company_name"),
-                    description=raw.get("description", "") or "",
+                    description=description,
                 )
             )
         return jobs

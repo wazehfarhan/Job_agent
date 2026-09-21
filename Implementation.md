@@ -13,47 +13,46 @@ Celery beat ────────┴──► Redis 7 (:6379) ◄┘  (broker
 ```
 
 - Entry point: `backend/app/main.py` — creates the FastAPI app, mounts CORS
-  (hardcoded `http://localhost:3000`), includes routers under `settings.API_PREFIX`
-  (`/api`), exposes `GET /api/health`.
+  from `ALLOWED_ORIGINS` (comma-separated env), includes routers under
+  `settings.API_PREFIX` (`/api`): auth, jobs, profile, resumes, applications.
+  Exposes `GET /api/health`.
 - Python **3.12** (see `backend/Dockerfile`); the host's system Python 3.9 is not
   sufficient — the code uses `X | None` annotations and SQLAlchemy 2.0 typed mappings.
 
 ## 2. Layering
 
 ```
-api/        HTTP routers (thin) — validate via schemas/, call services/models
-schemas/    Pydantic request/response — auth, profile (resume module misplaced → T0.1)
-services/   domain logic — discovery (dedup), resume_parser (pypdf / python-docx)
+api/        HTTP routers (thin) — validate via schemas/, call services/agents/models
+schemas/    Pydantic request/response — auth, profile, resume, job, application
+services/   domain logic — discovery (dedup + content_hash), resume_parser, json_repair
+agents/     pipeline agents — extraction.py, matching.py (prompts in ../prompts/)
 models/     SQLAlchemy ORM — 12 tables (§3)
 core/       config (pydantic-settings), database (engine/session/Base),
             security (bcrypt + JWT), deps (get_current_user), redis (client)
-sources/    JobSource adapters + registry
-ai/         AIProvider abstraction (base, factory, ollama adapter)
-agents/ prompts/ browser/ → empty placeholders for pipeline stages
-tasks/      → Celery app (`app/tasks/celery_app.py`); real tasks land here
+sources/    JobSource adapters + registry (JOB_SOURCE_CONFIG-aware)
+ai/         AIProvider abstraction, factory (4 adapters), ollama/gemini/groq/anthropic
+browser/    (empty) Playwright automation lands here
+tasks/      Celery app (app/tasks/celery_app.py); real tasks land here
 ```
 
-Request flow: `HTTP → router → get_current_user (JWT) → get_db (session) → service/model → Pydantic response`.
+Request flow: `HTTP → router → get_current_user (JWT) → get_db (session) → service/agent → Pydantic response`.
 
 ## 3. Data model
 
 Every table inherits `TimestampedBase` (`app/models/base.py`): `id UUID (uuid4)`,
 `created_at`, `updated_at` (server default now / onupdate now).
+Schema: `alembic/versions/0001_initial_schema.py` (12 tables, 5 enum types,
+pgvector extension + hnsw cosine index on `jobs.embedding`).
 
 ```
 users ─1:1─ profiles ─1:N─ educations      (institution, degree, field, GPA optional)
                     ├─1:N─ certifications  (name, issuer, date, credential_url)
                     ├─1:N─ skills          (category enum: 10 categories)
-                    ├─1:N─ experiences     (org, role, dates, description,
-                    │                       skills_used[], achievements[])
-                    ├─1:N─ projects        (name, description, technologies[],
-                    │                       url, github_url, responsibilities[],
-                    │                       achievements[])
-                    └─1:1─ preferences     (target_roles, job_types, internship_types,
-                                            preferred_locations, work_modes, min_salary,
-                                            min_stipend, preferred_industries, keywords,
-                                            excluded_companies, excluded_roles,
-                                            min_match_score)
+                    ├─1:N─ experiences     (org, role, dates, skills_used[], achievements[])
+                    ├─1:N─ projects        (technologies[], links, achievements[])
+                    └─1:1─ preferences     (roles, types, locations, work modes,
+                                            min_salary/min_stipend, keywords,
+                                            excluded_companies/roles, min_match_score)
 
 users ─1:N─ resumes   (label, original_filename, file_path, file_type pdf|docx,
                        parsed_text, structured_data JSON — reserved, is_default)
@@ -61,14 +60,14 @@ users ─1:N─ resumes   (label, original_filename, file_path, file_type pdf|do
 jobs                  (source, source_job_id, url, company, title, description,
                        location, work_mode, employment_type, salary_min/max,
                        currency, required_skills[], preferred_skills[],
-                       experience_requirement, education_requirement, deadline,
+                       experience/education_requirement, deadline,
                        application_url, posted_at, discovered_at,
-                       status, content_hash)
+                       status, content_hash, embedding vector(768))
 
 users ─1:N─ applications ─N:1─ jobs
       applications ─1:N─ status_events  (append-only timeline)
       application: resume_id FK, cover_letter, answers_json,
-                   match_score int, match_category strong|possible|weak|ineligible
+                   match_score int, match_category, match_reasons text[]
 ```
 
 **Enums**
@@ -77,10 +76,6 @@ users ─1:N─ applications ─N:1─ jobs
 - `JobStatus` discovered → extracted → {duplicate, matched, ineligible, expired}
 - `ApplicationStatus` discovered → analyzing → matched → preparing → awaiting_approval → approved → submitting → applied → {interview, rejected, withdrawn, failed, needs_user_action}
 - `SkillCategory` programming_language, framework, library, database, cloud, ai_ml, nlp, devops, testing, other
-
-**Migrations:** `alembic/env.py` imports every model module into `Base.metadata`
-and injects `DATABASE_URL` into the Alembic config; `alembic/versions/` is still
-empty — generating the initial migration is **T0.2**.
 
 ## 4. Auth implementation
 
@@ -95,90 +90,113 @@ empty — generating the initial migration is **T0.2**.
 
 ## 5. Job discovery & deduplication
 
-- `sources/base.py` — `JobSource` ABC: `search_jobs(criteria) -> list[DiscoveredJob]`
-  (minimal metadata), `get_job_details(url) -> str` (raw content for extraction).
-  `JobSearchCriteria` carries keywords / location / remote_only / employment_type.
+- `sources/base.py` — `JobSource` ABC: `search_jobs(criteria) -> list[DiscoveredJob]`,
+  `get_job_details(url) -> str` (raw content for extraction). `DiscoveredJob`
+  carries `source`, `source_job_id`, `url`, `title`, `company`, `description`.
 - `sources/registry.py` — `@register` decorator fills `_REGISTRY[name] → class`;
-  `get_enabled_sources()` instantiates every registered class. Note: the
-  `JOB_SOURCE_CONFIG` toggle exists in settings but is consulted nowhere yet (T1.8).
+  `get_enabled_sources()` consults `JOB_SOURCE_CONFIG` (JSON map name → bool;
+  `{}` = all registered); `get_source(name)` bypasses enablement for extraction.
 - `sources/remotive.py` — `@register`ed adapter for `https://remotive.com/api/remote-jobs`
   (no key). Rate-limit compliance is documented in the module docstring: ≤ ~4
   calls/day, ≤ 2/min → exactly **one** HTTP GET per discovery run, and full
   descriptions are cached from that same response so `get_job_details` normally
   makes zero extra calls. Attribution preserved: `url` stays Remotive's listing
   URL and `source` stays `"remotive"`.
-- `services/discovery.py` — for each enabled source → for each item →
-  `SELECT … WHERE source = … AND source_job_id = …`; insert only new rows; a
-  single commit at the end; returns only the newly created rows. Idempotent:
-  running twice discovers nothing new.
+- `services/discovery.py` — per source: try/except around `search_jobs` (a
+  broken source is logged and skipped, never corrupting the run — NFR-7);
+  per item: `SELECT … WHERE source = … AND source_job_id = …`; insert only new
+  rows with `description` + `content_hash`; single commit; returns only new
+  rows. Idempotent: running twice discovers nothing new.
 
 ## 6. AI layer
 
-- `ai/base.py` — `AIProvider.complete_json(system_prompt, user_prompt) -> str`
-  returns **raw text** deliberately; callers must parse/validate it (the JSON
-  repair service is planned but not yet created — T1.2).
-- `ai/providers/ollama.py` — POSTs to `{OLLAMA_BASE_URL}/api/chat` with
-  `format: "json"`, `stream: false`, model from `AI_MODEL`, timeout 120 s →
-  returns `message.content`.
-- `ai/factory.py` — `get_provider()` resolves `AI_PROVIDER` to a concrete
-  adapter and raises `NotImplementedError` for adapters that don't exist yet.
-  Only the Ollama adapter is implemented today; gemini/groq/openai would go
-  through `httpx`; the `anthropic` SDK is already pinned in requirements.
+- `ai/base.py` — `AIProvider.complete_json(system, user) -> str` returns **raw
+  text** deliberately; callers must parse/validate via `services/json_repair.py`.
+  `embed(text) -> list[float]` is an optional capability (base raises
+  `NotImplementedError`; matching treats that as "similarity unavailable").
+- `ai/factory.py` — `get_provider()` resolves `AI_PROVIDER`, fail-fasts on a
+  missing `AI_API_KEY` for hosted providers, and raises `NotImplementedError`
+  for unimplemented choices. Implemented: **ollama** (default, local, also
+  embeddings), **gemini** (REST + responseMimeType JSON), **groq**
+  (OpenAI-compatible + json_object), **anthropic** (pinned SDK). openai has no
+  adapter yet — the factory says so explicitly.
+- `services/json_repair.py` — strips code fences/preamble, extracts the first
+  balanced JSON object (string-aware brace matching), fixes trailing commas,
+  raises `ValueError` when nothing salvageable exists; `parse_model()` adds
+  pydantic validation.
 
-## 7. Resume pipeline
+## 7. Pipeline agents
 
-`POST /api/resumes` (multipart `label` + `file`):
+- **Extraction** (`agents/extraction.py`, prompts in `prompts/extraction.py`):
+  `extract_job(db, job)` — gets the raw description from the job's source
+  adapter (HTML stripped), prompts the provider, parses via `parse_json`,
+  coerces every field defensively (`_as_str/_as_float/_as_list/_as_enum` —
+  invalid values fall back to null/unspecified, never invented), sets
+  `status=extracted`, refreshes `content_hash`, and best-effort embeds the
+  description (a missing embedding model never fails extraction).
+  `extract_pending_jobs(db, limit)` batch-processes `discovered` jobs,
+  logging and skipping failures.
+- **Matching** (`agents/matching.py`, prompts in `prompts/matching.py`):
+  `match_job(db, job, user)` runs the spec pipeline — `_rule_eligibility`
+  (hard filters from preferences → `ineligible`), `_skill_overlap` (required
+  vs owned skills), cosine similarity (job embedding vs profile-text
+  embedding, optional), `_llm_score` (0–100 + category + reasons, optional,
+  never raises). Score/category/reasons persist on the application; a
+  `StatusEvent` is appended for `discovered → matched`; the LLM can never
+  overrule a hard rule failure.
 
-1. Extension whitelist {pdf, docx} → else 400.
-2. Size ≤ `MAX_UPLOAD_MB` → else 413.
-3. Write to `UPLOAD_DIR/<user_id>/<uuid4>.<ext>` (UUID name — path-traversal safe).
-4. `services/resume_parser.extract_text` (pypdf `PdfReader` / python-docx
-   `Document`); on exception the file is still stored with `parsed_text = NULL`
-   (never guess content — scanned PDFs surface as null).
-5. Insert `resumes` row → 201 with `ResumeDetailOut`.
+## 8. Resume pipeline & uploads
 
-Also: `set-default` clears `is_default` on all of the user's other resumes
-first; `delete` unlinks the file from disk, then deletes the row (204).
-
-## 8. Configuration reference
-
-Defined once in `core/config.py` (pydantic-settings, `.env`, cached via
-`@lru_cache`); full table in [README.md](README.md). Required at boot (no
-defaults → fail fast): `SECRET_KEY`, `DATABASE_URL`, `REDIS_URL`.
+`POST /api/resumes` (multipart `label` + `file`): extension whitelist
+{pdf, docx} → 400; size ≤ `MAX_UPLOAD_MB` → 413; write to
+`UPLOAD_DIR/<user_id>/<uuid4>.<ext>` (UUID name — path-traversal safe);
+`services/resume_parser.extract_text` (pypdf `PdfReader` / python-docx
+`Document`); on exception the file is still stored with `parsed_text = NULL`
+(scanned PDFs surface as null, never guessed). `set-default` clears
+`is_default` on the user's other resumes first; `delete` unlinks the file
+from disk, then deletes the row (204).
 
 ## 9. Docker
 
 `docker-compose.yml` services: `postgres` (pgvector/pgvector:pg16),
 `redis` (redis:7-alpine), `backend` (build `./backend`, uvicorn `--reload`,
-port 8000), `worker` / `scheduler` (celery worker/beat on the now-implemented
-`app/tasks/celery_app.py`), `frontend` (build `./frontend`
-— unbuildable until Next.js is scaffolded, T2.1). Volumes: named `pgdata`;
-live source binds for backend/worker/scheduler/frontend (with an anonymous
-`/app/node_modules` volume for the frontend).
+port 8000), `worker` / `scheduler` (celery worker/beat on
+`app/tasks/celery_app.py`), `frontend` (build `./frontend` — unbuildable
+until Next.js is scaffolded, T2.1). Volumes: named `pgdata`; live source
+binds for backend/worker/scheduler/frontend (anonymous `/app/node_modules`
+for the frontend). Use `.env.docker.example` → `.env` so in-network
+hostnames resolve. First-boot sequence:
+
+```bash
+docker compose up postgres redis
+docker compose run --rm backend alembic upgrade head   # creates all 12 tables
+docker compose up
+```
 
 ## 10. Testing
 
 `backend/tests/` contains only `__init__.py`. pytest + pytest-asyncio are
-pinned in `requirements.txt`, but nothing is tested yet — see T3.4 for the
-planned suite.
+pinned in `requirements.txt`, but nothing is tested yet — T3.4 defines the
+suite.
 
-## 11. Known issues / technical debt (as of 2026-09-21)
+## 11. Open items / technical debt (as of 2026-09-21)
 
-| Issue | Impact | Tracking |
-|-------|--------|----------|
-| No Alembic migration generated | No tables → every DB endpoint 500s at runtime | T0.2 (needs a live Postgres to autogenerate against) |
-| `JOB_SOURCE_CONFIG` parsed nowhere | Source toggles not honored | T1.8 |
-| No vector columns despite pgvector dependency | Matching/similarity blocked | T1.3 |
-| `json_repair.py` referenced in docstrings but not created | Extraction blocked | T1.2 |
-| CORS hardcoded to `http://localhost:3000` | Deploy friction | T4.3 |
-| No LICENSE, CI, or tests yet | Safety / reproducibility | T3.4–T3.5 |
-| `frontend/` has no package.json | compose `frontend` image unbuildable | T2.1 |
+| Item | Tracking |
+|------|----------|
+| Migration `0001` is hand-written — verify `alembic upgrade head` against a live Postgres | T0.2 note |
+| Frontend written but never executed — run `npm install && npm run dev`; commit the lockfile after | T2.1 note |
+| Celery beat schedule + real tasks | T3.1 |
+| Playwright browser agent | T3.2 |
+| Notifications | T3.3 |
+| Test suite + CI + LICENSE | T3.4–T3.5 |
+| Per-user discovery criteria not wired end-to-end | FR-15 |
+| Docs upkeep | T4.4 (ongoing) |
 
-> Resolved 2026-09-21: resume schemas moved to `app/schemas/resume.py` (boot
-> blocker T0.1); `app/tasks/celery_app.py` created (T0.3); `.env.docker.example`
-> added with compose-correct hostnames (T0.4); `ai/factory.get_provider()`
-> implemented (T0.5); `.env.example` aligned with code defaults (T0.6); jobs
-> endpoints now use response models + real 404 (T0.7).
+> Resolved 2026-09-21 (P0 + P1): boot blocker (resume schemas), Celery app,
+> compose networking, AI factory + 3 new providers, `.env` alignment, jobs
+> 404 + response models, extraction agent, json_repair, embeddings +
+> pgvector, matching agent, applications API, content_hash,
+> JOB_SOURCE_CONFIG, CORS from env, model re-exports.
 
 ## 12. How to add a new job source (pattern)
 
@@ -201,20 +219,22 @@ class GreenhouseSource(JobSource):
 
 Rules: only permitted methods (public APIs / official feeds / ToS-permitted
 scraping); preserve attribution and rate limits; register via the decorator;
-nothing else in the codebase changes.
+optionally add `{"greenhouse": true}` to `JOB_SOURCE_CONFIG` — nothing else
+in the codebase changes.
 
 ## 13. How to add a new AI provider (pattern)
 
 ```python
-# backend/app/ai/providers/gemini.py
+# backend/app/ai/providers/openai.py
 from app.ai.base import AIProvider
 from app.core.config import get_settings
 
-class GeminiProvider(AIProvider):
-    name = "gemini"
+class OpenAIProvider(AIProvider):
+    name = "openai"
 
     def complete_json(self, system_prompt: str, user_prompt: str) -> str:
         ...  # call the API; return RAW text — validation is the caller's job
 ```
 
-Then add the branch to `get_provider()` once `ai/factory.py` is implemented (T0.5).
+Then add the branch to `get_provider()` in `app/ai/factory.py` (and pin the
+SDK in requirements.txt if you use one rather than httpx).

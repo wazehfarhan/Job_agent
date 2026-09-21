@@ -3,10 +3,12 @@ Job model — one row per discovered posting (see spec section 10).
 
 `content_hash` + `source`/`source_job_id` are what deduplication (section 9)
 keys off of; the matching pipeline (section 11) reads the structured fields
-populated by the Job Extraction Agent.
+populated by the Job Extraction Agent. `embedding` is the pgvector column for
+semantic matching (Todo T1.3).
 """
 import enum
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import ARRAY, Enum, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -73,3 +75,6 @@ class Job(Base, TimestampedBase):
 
     status: Mapped[JobStatus] = mapped_column(Enum(JobStatus), default=JobStatus.discovered, index=True)
     content_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    # Semantic matching (Todo T1.3). 768 dims = nomic-embed-text (AI_EMBED_MODEL);
+    # change the migration, this column, and the config together.
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(768), nullable=True)

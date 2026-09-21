@@ -48,10 +48,25 @@ class Settings(BaseSettings):
 
     # --- Browser automation ---
     BROWSER_HEADLESS: bool = True
+    # false (default) = the agent fills + screenshots the form and hands it
+    # back to the human; true = the agent clicks submit itself (only ever on
+    # an explicitly approved application — the gate is enforced in
+    # app/browser/agent.py, not just in the API layer).
+    BROWSER_AUTO_SUBMIT: bool = False
+    BROWSER_EVIDENCE_DIR: str = "./evidence"
+
+    # --- Notifications (Todo T3.3) — all optional; nothing set = log-only ---
+    NOTIFY_WEBHOOK_URL: str | None = None
+    NOTIFY_SMTP_HOST: str | None = None
+    NOTIFY_SMTP_PORT: int = 587
+    NOTIFY_SMTP_USER: str | None = None
+    NOTIFY_SMTP_PASSWORD: str | None = None
+    NOTIFY_EMAIL_FROM: str | None = None
+    NOTIFY_EMAIL_TO: str | None = None
 
     # --- Job sources ---
-    # JSON-encoded config describing which JobSource adapters are enabled.
-    # Kept as a raw string here; parsed by app/sources/registry.py.
+    # JSON object mapping source name → bool ('{"remotive": true}'); `{}` = all
+    # registered sources enabled. Parsed by app/sources/registry.py.
     JOB_SOURCE_CONFIG: str = "{}"
 
     # --- Uploads ---

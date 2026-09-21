@@ -47,4 +47,3 @@ def get_provider() -> AIProvider:
         "Implemented: ['ollama', 'gemini', 'groq', 'anthropic']. Add one under "
         "app/ai/providers/ and wire a branch here (see Implementation.md §13)."
     )
-

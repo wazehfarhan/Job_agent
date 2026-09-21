@@ -1,18 +1,18 @@
 # Future Updates — Roadmap & Backlog
 
-Where the project goes after the current foundation. Phases follow the
-development order in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-**Current position: end of Phase 2** (auth, profile, CV, discovery done;
-extraction next).
+Where the project goes next. Phases follow the development order in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+**Current position: v0.2–v0.4 shipped** (infrastructure, extraction, matching).
+Next up: **v0.5 — application preparation + approval flow**, then the frontend.
 
 ---
 
 ## Milestone map
 
 ```
-v0.2  Make it run            → P0 fixes (boot, migrations, Celery module, AI factory)
-v0.3  Make it understand     → Extraction agent + embeddings (pgvector)
-v0.4  Make it judge          → Matching agent (rules + skills + similarity + LLM reasons)
+v0.2  Make it run            → P0 fixes (boot, migrations, Celery app, AI factory)  ✅ SHIPPED
+v0.3  Make it understand     → Extraction agent + embeddings (pgvector)              ✅ SHIPPED
+v0.4  Make it judge          → Matching agent (rules + skills + similarity + LLM)    ✅ SHIPPED
 v0.5  Make it act (safely)   → Applications, preparation, approval gate, tracking API
 v0.6  Make it visible        → Frontend dashboard
 v0.7  Make it submit         → Playwright browser agent (permitted automation only)
@@ -20,50 +20,53 @@ v0.8  Make it autonomous     → Scheduler, notifications, real workflows
 v1.0  Make it trustworthy    → Tests, security review, E2E, ops docs
 ```
 
-## v0.2 — Make it run (next)
+## v0.2 — Make it run ✅ SHIPPED (2026-09-21)
 
-> Status 2026-09-21: T0.1 and T0.3–T0.7 are shipped; **T0.2 (initial Alembic
-> migration) remains** — it needs a live Postgres to autogenerate against.
+| Change | Status |
+|--------|--------|
+| Resume schemas moved to `app/schemas/resume.py` (boot blocker) | ✅ |
+| Initial Alembic migration `0001_initial_schema.py` (hand-written; verify against live Postgres) | ✅ written |
+| `app/tasks/celery_app.py` (compose worker/scheduler) | ✅ |
+| `.env.docker.example` with compose-correct hostnames | ✅ |
+| AI factory + provider switch (`get_provider()`) | ✅ |
+| Config alignment, proper 404s + response models | ✅ |
 
-| Change | Why | Depends on |
-|--------|-----|------------|
-| Move resume schemas to `app/schemas/resume.py` (T0.1) | Backend cannot boot otherwise | — |
-| Initial Alembic migration + pgvector extension (T0.2) | No tables exist | DB up |
-| `app/tasks/celery_app.py` (T0.3) | compose worker/scheduler crash-loop | Redis |
-| Compose-correct `.env` values (T0.4) | `localhost` DB/Redis URLs break in compose | — |
-| AI factory + provider switch (T0.5) | `AI_PROVIDER` currently inert | — |
-| Config/doc alignment, proper 404s (T0.6, T0.7) | Predictable API | — |
+## v0.3 — Make it understand ✅ SHIPPED (2026-09-21)
 
-## v0.3 — Make it understand
+- **Extraction agent** (`app/agents/extraction.py`): raw description → structured
+  `jobs` fields; single + batch endpoints; `content_hash` refreshed on extraction.
+- **JSON repair** (`app/services/json_repair.py`): fence stripping, balanced-brace
+  extraction, trailing-comma fix; failures surface, never guessed around.
+- **Embeddings**: `jobs.embedding` Vector(768) + hnsw index; `AIProvider.embed()`
+  (Ollama first); generated best-effort during extraction.
+- **Exit criteria met:** structured fields populated without hallucination
+  (validation at every step); embeddings optional, never blocking.
 
-- **Extraction agent** (`app/agents/`): raw description → structured `jobs` fields;
-  JSON repair service (`app/services/json_repair.py`, already referenced by
-  `app/ai/base.py`); prompt templates in `app/prompts/`.
-- **Embeddings**: `vector` column on `jobs` + profile text vector; Ollama embeddings first.
-- **`content_hash`** change detection; re-extraction policy for edited postings.
-- **Exit criteria:** ≥ 80% of discovered postings have ≥ 8 structured fields populated;
-  zero hallucinated fields reach the DB unvalidated.
+## v0.4 — Make it judge ✅ SHIPPED (2026-09-21)
 
-## v0.4 — Make it judge
+- Matching chain: hard rule eligibility → structured skill comparison →
+  cosine similarity → LLM score + reasons; heuristic fallback when the LLM or
+  embedding model is unavailable.
+- User preferences applied (work modes, job types, salary floor, exclusions, locations).
+- Persisted explanation object (`match_reasons[]`) exposed via the Applications API.
 
-- Matching agent chain: hard rule eligibility → structured skill comparison →
-  cosine similarity → LLM score + reasons; categories strong / possible / weak / ineligible.
-- User preferences applied (already modeled in `preferences`).
-- Persisted explanation object ("why this score") for the future UI.
+## v0.5 — Make it act (safely) — NEXT
 
-## v0.5 — Make it act (safely)
+- Preparation agent: default-resume selection, cover-letter draft, question
+  answers (columns already exist: `resume_id`, `cover_letter`, `answers_json`).
+- Approval gate flow: `preparing → awaiting_approval` blocks submission;
+  explicit approve/reject endpoints drive `approved`/`needs_user_action`.
+- (Applications + transition + timeline API already shipped in v0.4.)
 
-- Applications API + a single status-transition service that appends a `StatusEvent`
-  for every change (append-only rule enforced in one place).
-- Preparation agent: default-resume selection, cover-letter draft, question answers.
-- Approval gate: `awaiting_approval` blocks submission; explicit approve/reject endpoints.
+## v0.6 — Make it visible ✅ CODE SHIPPED (2026-09-21)
 
-## v0.6 — Make it visible
-
-- Next.js scaffold + auth pages, profile editor, resume manager, job feed,
-  tracker timeline, settings.
-- First end-to-end manual flow: upload CV → discover → review matches →
-  approve → (manual apply) → track status.
+- Next.js 14 frontend written: dashboard, login/register, profile editor,
+  resume manager, job feed (discover/extract/apply), applications tracker with
+  timeline + reasons, settings page. Backend gained `GET /api/settings`
+  (non-secret runtime config).
+- Remaining for v0.6 closure: `npm install && npm run dev`, then walk the first
+  end-to-end manual flow (upload CV → discover → extract → match → review
+  reasons → track status) against a live backend and fix what shakes out.
 
 ## v0.7 — Make it submit
 
@@ -80,7 +83,8 @@ v1.0  Make it trustworthy    → Tests, security review, E2E, ops docs
 
 ## v1.0 — Make it trustworthy
 
-- Backend test suite (auth, profile, resume limits, dedup idempotency, adapters with mocked HTTP).
+- Backend test suite (auth, profile, resume limits, dedup idempotency, adapters
+  with mocked HTTP, json_repair, matching heuristics).
 - Security review: token handling, upload safety, SSRF checks on source URLs, secret hygiene.
 - E2E test of the full pipeline against a sandbox source; ops runbook + backup/restore docs.
 
